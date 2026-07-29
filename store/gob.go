@@ -3,9 +3,13 @@ package store
 import (
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -157,7 +161,13 @@ func (s *GOBStore) Load(ctx context.Context) error {
 }
 
 // loadUnlocked performs the actual load without any locking.
+// Corrupt / truncated indexes are quarantined to index.gob.corrupt and the
+// store starts empty so the next watch scan can rebuild. A failed decode used
+// to hard-error forever (unexpected EOF crash loop).
 func (s *GOBStore) loadUnlocked() error {
+	s.chunks = make(map[string]Chunk)
+	s.documents = make(map[string]Document)
+
 	file, err := os.Open(s.indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -170,7 +180,21 @@ func (s *GOBStore) loadUnlocked() error {
 	var data gobData
 	decoder := gob.NewDecoder(file)
 	if err := decoder.Decode(&data); err != nil {
-		return fmt.Errorf("failed to decode index: %w", err)
+		// Empty file and torn writes both surface as EOF / unexpected EOF.
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !isGobDecodeEOF(err) {
+			// Still recover — any decode failure means the on-disk snapshot is unusable.
+			log.Printf("Warning: index decode failed (%v); quarantining and rebuilding", err)
+		} else {
+			log.Printf("Warning: index truncated or empty (%v); quarantining and rebuilding", err)
+		}
+		_ = file.Close()
+		if qerr := quarantineCorruptIndex(s.indexPath); qerr != nil {
+			// If quarantine lost a race (another process already moved it), adopt empty.
+			if !os.IsNotExist(qerr) {
+				return fmt.Errorf("failed to decode index: %w (quarantine also failed: %v)", err, qerr)
+			}
+		}
+		return nil
 	}
 
 	s.chunks = data.Chunks
@@ -183,6 +207,27 @@ func (s *GOBStore) loadUnlocked() error {
 		s.documents = make(map[string]Document)
 	}
 
+	return nil
+}
+
+// isGobDecodeEOF matches gob's wrapped unexpected-EOF strings.
+func isGobDecodeEOF(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "EOF")
+}
+
+// quarantineCorruptIndex renames index.gob -> index.gob.corrupt (replacing any
+// prior evidence). Losers of a rename race with another reader get IsNotExist.
+func quarantineCorruptIndex(indexPath string) error {
+	corruptPath := indexPath + ".corrupt"
+	_ = os.Remove(corruptPath) // best-effort replace of stale evidence
+	if err := os.Rename(indexPath, corruptPath); err != nil {
+		return err
+	}
+	log.Printf("Warning: quarantined corrupt index to %s — run 'grepai watch' to rebuild", corruptPath)
 	return nil
 }
 
@@ -214,23 +259,43 @@ func (s *GOBStore) Persist(ctx context.Context) error {
 }
 
 // persistUnlocked performs the actual persist without any locking.
+// Writes to a sibling temp file, fsyncs, then atomically renames over the
+// target. A crash mid-encode can no longer leave a truncated index.gob —
+// the previous good snapshot survives.
 func (s *GOBStore) persistUnlocked() error {
-	file, err := os.Create(s.indexPath)
-	if err != nil {
-		return fmt.Errorf("failed to create index file: %w", err)
-	}
-	defer file.Close()
-
 	data := gobData{
 		Chunks:    s.chunks,
 		Documents: s.documents,
 	}
 
-	encoder := gob.NewEncoder(file)
-	if err := encoder.Encode(data); err != nil {
+	dir := filepath.Dir(s.indexPath)
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(s.indexPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create index temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := gob.NewEncoder(tmpFile).Encode(data); err != nil {
+		_ = tmpFile.Close()
 		return fmt.Errorf("failed to encode index: %w", err)
 	}
-
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to sync index temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close index temp file: %w", err)
+	}
+	if err := fileutil.ReplaceFileAtomically(tmpPath, s.indexPath); err != nil {
+		return fmt.Errorf("failed to replace index file: %w", err)
+	}
+	cleanupTemp = false
 	return nil
 }
 

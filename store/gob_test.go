@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -442,5 +443,128 @@ func TestGOBStore_FileLocking(t *testing.T) {
 	}
 	if chunks[0].ID != "c1" {
 		t.Errorf("Expected chunk ID c1, got %s", chunks[0].ID)
+	}
+}
+
+func TestGOBStore_PersistIsAtomic(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "index.gob")
+	ctx := context.Background()
+
+	s1 := NewGOBStore(indexPath)
+	if err := s1.SaveChunks(ctx, []Chunk{
+		{ID: "c1", FilePath: "a.go", Content: "first", Vector: []float32{1, 0}},
+	}); err != nil {
+		t.Fatalf("SaveChunks: %v", err)
+	}
+	if err := s1.SaveDocument(ctx, Document{Path: "a.go", Hash: "h1", ChunkIDs: []string{"c1"}}); err != nil {
+		t.Fatalf("SaveDocument: %v", err)
+	}
+	if err := s1.Persist(ctx); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	// Hold an open read handle across a second persist. Atomic rename keeps the
+	// previous inode alive for the retained descriptor (POSIX). Truncate-in-place
+	// would rewrite the same inode and the open handle would see new bytes.
+	f, err := os.Open(indexPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer f.Close()
+
+	before := make([]byte, 64)
+	nBefore, _ := f.Read(before)
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+
+	if err := s1.SaveChunks(ctx, []Chunk{
+		{ID: "c2", FilePath: "b.go", Content: "second-longer-content-to-change-bytes", Vector: []float32{0, 1}},
+	}); err != nil {
+		t.Fatalf("SaveChunks2: %v", err)
+	}
+	if err := s1.Persist(ctx); err != nil {
+		t.Fatalf("Persist2: %v", err)
+	}
+
+	afterOpen := make([]byte, 64)
+	nAfterOpen, _ := f.Read(afterOpen)
+	if nBefore != nAfterOpen || string(before[:nBefore]) != string(afterOpen[:nAfterOpen]) {
+		t.Fatalf("open handle saw rewritten inode — Persist is not atomic")
+	}
+
+	// Fresh open sees the new snapshot.
+	s2 := NewGOBStore(indexPath)
+	if err := s2.Load(ctx); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	chunks, err := s2.GetAllChunks(ctx)
+	if err != nil {
+		t.Fatalf("GetAllChunks: %v", err)
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("expected >=2 chunks after second persist, got %d", len(chunks))
+	}
+
+	// No temp leftovers.
+	entries, err := os.ReadDir(filepath.Dir(indexPath))
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp-") {
+			t.Fatalf("leftover temp file: %s", e.Name())
+		}
+	}
+}
+
+func TestGOBStore_LoadRecoversCorruptIndex(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "index.gob")
+	ctx := context.Background()
+
+	// Truncated / garbage file — classic unexpected EOF case.
+	if err := os.WriteFile(indexPath, []byte{0x01, 0x02, 0x03}, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	s := NewGOBStore(indexPath)
+	if err := s.Load(ctx); err != nil {
+		t.Fatalf("Load should recover, got: %v", err)
+	}
+	docs, numChunks := s.Stats()
+	if docs != 0 || numChunks != 0 {
+		t.Fatalf("expected empty store after recovery, got docs=%d chunks=%d", docs, numChunks)
+	}
+	if _, err := os.Stat(indexPath); !os.IsNotExist(err) {
+		t.Fatalf("corrupt index should be quarantined away from %s", indexPath)
+	}
+	if _, err := os.Stat(indexPath + ".corrupt"); err != nil {
+		t.Fatalf("expected quarantine file: %v", err)
+	}
+
+	// Rebuild path still works.
+	if err := s.SaveChunks(ctx, []Chunk{
+		{ID: "c1", FilePath: "a.go", Content: "ok", Vector: []float32{1}},
+	}); err != nil {
+		t.Fatalf("SaveChunks: %v", err)
+	}
+	if err := s.Persist(ctx); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	s2 := NewGOBStore(indexPath)
+	if err := s2.Load(ctx); err != nil {
+		t.Fatalf("Load after rebuild: %v", err)
+	}
+}
+
+func TestGOBStore_LoadRecoversZeroByteIndex(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "index.gob")
+	ctx := context.Background()
+	if err := os.WriteFile(indexPath, nil, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	s := NewGOBStore(indexPath)
+	if err := s.Load(ctx); err != nil {
+		t.Fatalf("Load zero-byte: %v", err)
 	}
 }

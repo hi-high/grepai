@@ -31,12 +31,13 @@ import (
 )
 
 var (
-	watchBackground bool
-	watchLogDir     string
-	watchStatus     bool
-	watchStop       bool
-	watchWorkspace  string
-	watchNoUI       bool
+	watchBackground  bool
+	watchLogDir      string
+	watchStatus      bool
+	watchStop        bool
+	watchWorkspace   string
+	watchNoUI        bool
+	watchNoWorktrees bool
 )
 
 var (
@@ -93,6 +94,7 @@ func init() {
 	watchCmd.Flags().BoolVar(&watchStop, "stop", false, "Stop the background watcher")
 	watchCmd.Flags().StringVar(&watchWorkspace, "workspace", "", "Workspace name for multi-project mode")
 	watchCmd.Flags().BoolVar(&watchNoUI, "no-ui", false, "Disable interactive UI in foreground mode")
+	watchCmd.Flags().BoolVar(&watchNoWorktrees, "no-worktrees", false, "Do not auto-discover/index linked git worktrees (primary checkout only)")
 }
 
 func runWatch(cmd *cobra.Command, args []string) error {
@@ -361,6 +363,12 @@ func startBackgroundWatch(logDir, worktreeID string) error {
 	args := []string{"watch"}
 	if watchLogDir != "" {
 		args = append(args, "--log-dir", watchLogDir)
+	}
+	if watchNoWorktrees {
+		args = append(args, "--no-worktrees")
+	}
+	if watchNoUI {
+		args = append(args, "--no-ui")
 	}
 
 	// Spawn background process
@@ -956,8 +964,11 @@ type watchSessionEventObserver func(projectRoot string, event watcher.FileEvent)
 
 const (
 	worktreeReconcileInterval = 3 * time.Second
-	sessionShutdownTimeout    = 2 * time.Second
-	maxSessionRetryBackoff    = 30 * time.Second
+	// Large multi-project / multi-worktree indexes need more than 2s to flush
+	// GOB/symbol state on stop. A short timeout caused shutdown tears and
+	// corrupted indexes (unexpected EOF). 90s is still a hard upper bound.
+	sessionShutdownTimeout = 90 * time.Second
+	maxSessionRetryBackoff = 30 * time.Second
 )
 
 func watchProject(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func()) error {
@@ -1348,8 +1359,12 @@ func withWatchSupervisorRetryBackoff(backoff func(attempt int) time.Duration) dy
 }
 
 func newDynamicWatchSupervisorConfig() dynamicWatchSupervisorConfig {
+	discover := discoverWorktreesForWatch
+	if watchNoWorktrees {
+		discover = func(projectRoot string) []string { return nil }
+	}
 	return dynamicWatchSupervisorConfig{
-		discoverWorktrees: discoverWorktreesForWatch,
+		discoverWorktrees: discover,
 		sessionRunner: func(
 			ctx context.Context,
 			projectRoot string,
