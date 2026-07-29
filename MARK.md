@@ -1,10 +1,17 @@
 # Mark's local grepai fork
 
-Upstream: yoanbernabeu/grepai @ v0.35.0 (effectively unmaintained for our needs).
+**GitHub:** https://github.com/hi-high/grepai  
+**Upstream:** https://github.com/yoanbernabeu/grepai  
+
+Fork is `ahead by 2` of upstream `main` with the harden commits. Local checkout: `~/Code/Labs/grepai-src`.
 
 ## Branch
 
-`mark/local-harden` — version `0.35.0-mark.1`
+`main` and `mark/local-harden` both point at the same tip (version `0.35.0-mark.1`).
+
+Remotes:
+- `origin` → `hi-high/grepai`
+- `upstream` → `yoanbernabeu/grepai`
 
 ## Patches
 
