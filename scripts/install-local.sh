@@ -16,4 +16,9 @@ mkdir -p "$(dirname "$DEST")"
 cp -f bin/grepai "$DEST"
 chmod +x "$DEST"
 echo "installed: $DEST ($("$DEST" version))"
-echo "homebrew still at: $(command -v -a grepai | tail -n +2 | head -1 || true)"
+if command -v brew >/dev/null 2>&1; then
+  brew_grepai="$(brew --prefix 2>/dev/null)/bin/grepai"
+  if [ -x "$brew_grepai" ] && [ "$brew_grepai" != "$DEST" ]; then
+    echo "homebrew still at: $brew_grepai (PATH should prefer ~/.local/bin)"
+  fi
+fi
